@@ -1,0 +1,14 @@
+
+
+torch
+torchvision
+Pillow
+opencv-python
+numpy
+
+
+Flask==3.0.2
+pillow==10.2.0
+ultralytics==8.1.0
+supabase==2.3.0
+gunicorn==21.2.0
