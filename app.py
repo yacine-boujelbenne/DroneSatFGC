@@ -10,8 +10,8 @@ from supabase import create_client, Client
 # ============================================================================
 # CONFIGURATION - Environment variables (Set these in your Render Dashboard)
 # ============================================================================
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://your-supabase-id.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "your-supabase-anon-key")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")
 IMG_SIZE = 640
 
