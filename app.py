@@ -16,7 +16,18 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")
 IMG_SIZE = 640
 
 # Initialize Supabase Client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Initialize Supabase Client safely
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("CRITICAL WARNING: SUPABASE_URL or SUPABASE_KEY environment variables are missing!")
+    # Fallback to dummy values to let the app build/bind ports successfully, 
+    # allowing you to fix variables without an immediate server crash layout.
+    supabase = None 
+else:
+    try:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        print(f"Failed to initialize Supabase: {e}")
+        supabase = None
 
 # Initialize YOLO model
 print("Loading YOLOv8 Model...")
