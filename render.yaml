@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: DroneSatFGC
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bridge_server:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
