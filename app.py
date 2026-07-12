@@ -17,13 +17,13 @@ What it does, per reading:
 
 Local run (for testing before you deploy):
     export SUPABASE_URL="https://xxxx.supabase.co"
-    export SUPABASE_SERVICE_KEY="your-service-role-key"
+    export SUPABASE_SERVICE_KEY="your-secret-key"
     pip install -r requirements.txt
-    python bridge_server.py
+    python app.py
 
 Render deployment:
     Build command: pip install -r requirements.txt
-    Start command: gunicorn bridge_server:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    Start command: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     Env vars (set in the Render dashboard, not in this file): SUPABASE_URL,
     SUPABASE_SERVICE_KEY
 
@@ -37,14 +37,19 @@ import io
 import os
 import threading
 import time
-from pathlib import Path
 
 from flask import Flask, request, jsonify
 from PIL import Image
 from ultralytics import YOLO
 
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 from supabase import create_client
+
+load_dotenv()  # loads a local .env file into os.environ if one exists — this
+                # is for convenience when testing on your own machine. On
+                # Render there is no .env file, and this line does nothing —
+                # the dashboard's Environment Variables are already sitting
+                # in os.environ by the time this script runs.
 
 # ============================================================================
 # CONFIG
@@ -52,14 +57,12 @@ from supabase import create_client
 MODEL_PATH = "best.pt"          # your trained weights, committed alongside this file
 IMG_SIZE = 640                  # matches your test[1].py
 
-env_path = Path(__file__).with_name(".env")
-env = dotenv_values(env_path)
-
-SUPABASE_URL = env["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = env["SUPABASE_SECRET_KEY"]  # service_role key —
-    # NOT the anon key. This bypasses Row Level Security so the server can
-    # always write, which is why it must never end up in the dashboard's
-    # client-side code.
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]  # the SECRET key
+    # (sb_secret_... in Supabase's newer key format) — NOT the publishable/
+    # anon one. This bypasses Row Level Security so the server can always
+    # write, which is exactly why it must only ever live here as a Render
+    # environment variable, never in dashboard.html or any client-side code.
 
 READINGS_TABLE = "readings"
 PHOTOS_BUCKET = "photos"
@@ -227,8 +230,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Bridge server listening on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
