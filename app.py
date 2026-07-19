@@ -1,19 +1,18 @@
 """
 DroneSatFGC — Fire/Smoke Bridge Service
 ========================================
-Deployed on Render. Sits between the MKR1000 and Supabase.
+Deployed on Render. Sits between the ESP32 and Supabase.
 
-  MKR1000 --(HTTPS)--> this service --(supabase-py)--> Supabase (Postgres + Storage)
+  ESP32 --(HTTPS)--> this service --(supabase-py)--> Supabase (Postgres + Storage)
 
 What it does, per reading:
-  1. Receives sensor data (POST /sensor-data) and a photo (POST /upload-image)
-     from the board — tagged with a shared "id" so they can be paired up.
+  1. Receives sensor data and a photo together (POST /ingest) as multipart/form-data.
+     The legacy split endpoints remain available while hardware is migrated.
   2. Runs your fire/smoke classifier on the photo, using the exact same
      prediction logic as your test[1].py (imgsz=640, r.probs.top1/top1conf).
-  3. Once both pieces for a given id have arrived, uploads the image to the
-     Supabase "photos" storage bucket and inserts one combined row (sensors +
-     prediction + image URL) into the "readings" table. The dashboard picks
-     it up from there in real time via Supabase Realtime.
+  3. Uploads the image to the Supabase "photos" storage bucket and inserts one
+     combined row (sensors + prediction + image URL) into the "readings"
+     table. The dashboard picks it up via Supabase Realtime.
 
 Local run (for testing before you deploy):
     export SUPABASE_URL="https://xxxx.supabase.co"
@@ -34,6 +33,7 @@ run out of memory. One worker is plenty for a single board syncing every
 """
 
 import io
+import math
 import os
 import threading
 import time
@@ -71,6 +71,8 @@ PHOTOS_BUCKET = "photos"
 # before inserting whatever we have anyway, so a dropped packet never
 # silently loses data — it just goes in incomplete instead.
 PENDING_TIMEOUT_SECONDS = 20
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_REQUEST_BYTES = MAX_IMAGE_BYTES + 64 * 1024
 
 # ============================================================================
 # Supabase + model setup — both done once at import time, not per-request
@@ -83,6 +85,7 @@ CLASS_NAMES = model.names  # dynamic — don't hardcode, this always matches you
 print("Classes:", CLASS_NAMES)
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 
 # In-memory holding area for readings we've received half of.
 # reading_id (str) -> {"sensor": {...}, "sensor_time": t, "image_bytes": b"...",
@@ -94,6 +97,71 @@ pending_lock = threading.Lock()
 @app.route("/", methods=["GET"])
 def health_check():
     return jsonify({"status": "DroneSatFGC bridge running", "classes": CLASS_NAMES})
+
+
+@app.route("/ingest", methods=["POST"])
+def ingest():
+    """Receive one atomic sensor reading and JPEG in a multipart request."""
+    if not request.mimetype == "multipart/form-data":
+        return jsonify({"error": "Content-Type must be multipart/form-data"}), 415
+
+    reading_id = request.form.get("reading_id", "").strip()
+    valid_id = (
+        reading_id
+        and len(reading_id) <= 128
+        and reading_id.isascii()
+        and all(char.isalnum() or char in "._-" for char in reading_id)
+    )
+    if not valid_id:
+        return jsonify({
+            "error": "reading_id must contain 1-128 ASCII letters, digits, '.', '_', or '-'"
+        }), 400
+
+    image = request.files.get("image")
+    if image is None:
+        return jsonify({"error": "image file part is required"}), 400
+
+    image_bytes = image.read(MAX_IMAGE_BYTES + 1)
+    if not image_bytes:
+        return jsonify({"error": "image is empty"}), 400
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        return jsonify({"error": "image exceeds 5 MiB limit"}), 413
+
+    try:
+        sensor = {
+            "temperature": _optional_float("temperature"),
+            "humidity": _optional_float("humidity"),
+            "pressure": _optional_float("pressure"),
+            "illuminance": _optional_float("illuminance"),
+            "uva": _optional_float("uva"),
+            "uvb": _optional_float("uvb"),
+            "uvIndex": _optional_float("uv_index", "uvIndex"),
+        }
+        prediction = _run_inference(image_bytes)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    record = {
+        "sensor": sensor,
+        "image_bytes": image_bytes,
+        "prediction": prediction,
+    }
+    row = _push_to_supabase(
+        reading_id, record, partial=False, require_image_backup=True
+    )
+    if row is None:
+        return jsonify({"error": "failed to persist reading"}), 502
+
+    print(f"[{reading_id}] multipart reading received, prediction: "
+          f"{prediction['class']} ({prediction['confidence']:.2%})")
+    return jsonify({
+        "status": "ok",
+        "reading_id": reading_id,
+        "prediction": prediction["class"],
+        "confidence": prediction["confidence"],
+        "image_url": row["image_url"],
+        "partial": row["partial"],
+    }), 200
 
 
 @app.route("/sensor-data", methods=["POST"])
@@ -133,7 +201,16 @@ def upload_image():
 
 def _run_inference(image_bytes):
     """Reuses the exact prediction logic from test[1].py, minus the GUI."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            if source.format != "JPEG":
+                raise ValueError("image is not JPEG encoded")
+            source.verify()
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            img = source.convert("RGB")
+    except Exception as exc:
+        raise ValueError("image is not a valid JPEG") from exc
+
     results = model(img, imgsz=IMG_SIZE, verbose=False)
     r = results[0]
 
@@ -151,6 +228,21 @@ def _run_inference(image_bytes):
     }
 
 
+def _optional_float(*field_names):
+    for name in field_names:
+        value = request.form.get(name)
+        if value is None or value.strip() == "":
+            continue
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be numeric") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be finite")
+        return number
+    return None
+
+
 def _try_finalize(reading_id):
     """If both sensor data and an image+prediction are in for this id, push it."""
     with pending_lock:
@@ -162,8 +254,9 @@ def _try_finalize(reading_id):
     _push_to_supabase(reading_id, record, partial=False)
 
 
-def _push_to_supabase(reading_id, record, partial):
+def _push_to_supabase(reading_id, record, partial, require_image_backup=False):
     image_url = None
+    storage_failed = False
 
     if "image_bytes" in record:
         path = f"{reading_id}.jpg"
@@ -175,7 +268,11 @@ def _push_to_supabase(reading_id, record, partial):
             )
             image_url = supabase.storage.from_(PHOTOS_BUCKET).get_public_url(path)
         except Exception as exc:
-            print(f"[{reading_id}] image upload failed, continuing without it: {exc}")
+            storage_failed = True
+            print(f"[{reading_id}] image upload failed: {exc}")
+
+    if storage_failed and require_image_backup:
+        return None
 
     sensor = record.get("sensor", {})
     prediction = record.get("prediction", {})
@@ -193,16 +290,33 @@ def _push_to_supabase(reading_id, record, partial):
         "prediction": prediction.get("class"),
         "confidence": prediction.get("confidence"),
         "probabilities": prediction.get("probabilities"),
-        "partial": partial,
+        "partial": partial or storage_failed,
     }
 
     try:
-        supabase.table(READINGS_TABLE).insert(row).execute()
-        status = "PARTIAL (timed out)" if partial else "complete"
+        existing = (
+            supabase.table(READINGS_TABLE)
+            .select("id")
+            .eq("reading_id", reading_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            (
+                supabase.table(READINGS_TABLE)
+                .update(row)
+                .eq("id", existing.data[0]["id"])
+                .execute()
+            )
+        else:
+            supabase.table(READINGS_TABLE).insert(row).execute()
+        status = "PARTIAL" if row["partial"] else "complete"
         print(f"[{reading_id}] inserted into Supabase — {status} — "
               f"prediction={prediction.get('class', 'n/a')}")
+        return row
     except Exception as exc:
         print(f"[{reading_id}] Supabase insert failed: {exc}")
+        return None
 
 
 def _cleanup_loop():
