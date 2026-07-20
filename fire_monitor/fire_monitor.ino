@@ -2,6 +2,12 @@
   ESP32 Fire Monitor
   Captures an ArduCAM JPEG and streams it with available telemetry in one
   TLS-verified multipart/form-data request. No SD card is required.
+
+  Pin map (this board):
+    ArduCAM SPI : CS=5, SCK=18, MISO=19, MOSI=23 (VSPI defaults)
+    I2C bus     : SDA=21, SCL=22 — shared by ArduCAM, BME280, HM3301 dust
+    GPS + SIM   : shared UART RX=3, TX=1 (GPS NMEA listen; SIM AT when needed)
+    MQ gas      : GPIO33 analog
 */
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -10,6 +16,9 @@
 #include <SPI.h>
 #include <time.h>
 #include <math.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include "Seeed_HM330X.h"
 
 #define WIFI_SSID        "Xiaomi_11T"
 #define WIFI_PASSWORD    "babushkara"
@@ -17,15 +26,22 @@
 #define SERVER_PORT      443
 #define INGEST_PATH      "/ingest"
 
-// ESP32 VSPI defaults are SCK=18, MISO=19, MOSI=23. Change CAM_CS to match
-// the actual ArduCAM CS wire. I2C defaults are SDA=21 and SCL=22.
+// Change CAM_CS / SMS_PHONE if your wiring or alert number differs.
 const int CAM_CS = 5;
+const int I2C_SDA = 21;
+const int I2C_SCL = 22;
+const int GPS_SIM_RX = 3;   // ESP32 RX  <- module TX
+const int GPS_SIM_TX = 1;   // ESP32 TX  -> module RX (SIM needs this)
+const int GAS_ADC_PIN = 33;
+const char SMS_PHONE[] = "+21644633222";
 
 const unsigned long CLOUD_SYNC_INTERVAL_MS = 15000;
 const unsigned long CAPTURE_TIMEOUT_MS = 5000;
 const unsigned long RESPONSE_TIMEOUT_MS = 130000;
+const unsigned long GPS_STALE_MS = 30000;
 const size_t IMAGE_CHUNK_SIZE = 1024;
 const uint8_t MAX_UPLOAD_ATTEMPTS = 2;
+const int GAS_ALERT_THRESHOLD = 2500;  // raw ADC (0-4095); tune on site
 const char MULTIPART_BOUNDARY[] = "----DroneSatESP32Boundary7MA4YWxk";
 
 #if !(defined(OV5640_MINI_5MP_PLUS) || defined(OV5642_MINI_5MP_PLUS))
@@ -37,6 +53,10 @@ ArduCAM myCAM(OV5640, CAM_CS);
 #else
 ArduCAM myCAM(OV5642, CAM_CS);
 #endif
+
+Adafruit_BME280 bme;
+HM330X dustSensor;
+HardwareSerial GpsSimSerial(2);  // UART2 remapped onto GPIO3/1
 
 // Render currently uses either Let's Encrypt or Google Trust Services.
 // These are the ISRG Root X1, GTS Root R1, and GTS Root R4 trust anchors.
@@ -119,18 +139,35 @@ sbqjYAuG7ZoIapVon+Kz4ZNkfF6Tpt95LY2F45TPI11xzPKwTdb+mciUqXWi4w==
 float latestTemperature = NAN;
 float latestHumidity = NAN;
 float latestPressure = NAN;
-float latestIlluminance = NAN;
-float latestUva = NAN;
-float latestUvb = NAN;
-float latestUvIndex = NAN;
+float latestPm1 = NAN;
+float latestPm25 = NAN;
+float latestPm10 = NAN;
+float latestGasRaw = NAN;
+float latestLatitude = NAN;
+float latestLongitude = NAN;
+float latestSimSignal = NAN;
 
+bool bmeReady = false;
+bool dustReady = false;
+bool simReady = false;
+bool gpsFixValid = false;
+unsigned long lastGpsFixMs = 0;
 unsigned long lastCloudSyncTime = 0;
+unsigned long lastSmsMs = 0;
 uint32_t readingSequence = 0;
+String gpsLine;
 
 bool initializeCamera();
+bool initializeSensors();
 void connectWiFi();
 void setClock();
+void pollGps();
+bool parseGpsSentence(const String &sentence);
+float nmeaToDegrees(const String &raw, const char hemisphere);
 void readSensors();
+void maybeSendSmsAlert();
+bool sendAtCommand(const char *command, unsigned long waitMs = 1000);
+bool sendSms(const String &message);
 bool captureAndUpload();
 bool sendMultipart(WiFiClientSecure &client, const String &readingId);
 bool streamJpegPart(WiFiClientSecure &client);
@@ -148,14 +185,19 @@ void setup() {
 
   pinMode(CAM_CS, OUTPUT);
   digitalWrite(CAM_CS, HIGH);
-  Wire.begin();
+  pinMode(GAS_ADC_PIN, INPUT);
+  analogReadResolution(12);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
   SPI.begin();
+  GpsSimSerial.begin(9600, SERIAL_8N1, GPS_SIM_RX, GPS_SIM_TX);
 
   if (!initializeCamera()) {
     Serial.println(F("Camera initialization failed; restart after checking wiring."));
     while (true) delay(1000);
   }
 
+  initializeSensors();
   connectWiFi();
   setClock();
   Serial.println(F("Fire monitor ready."));
@@ -207,14 +249,47 @@ bool initializeCamera() {
 }
 
 void loop() {
+  pollGps();
+
   unsigned long now = millis();
   if (lastCloudSyncTime == 0 ||
       now - lastCloudSyncTime >= CLOUD_SYNC_INTERVAL_MS) {
     lastCloudSyncTime = now;
     readSensors();
+    maybeSendSmsAlert();
     captureAndUpload();
   }
   delay(10);
+}
+
+bool initializeSensors() {
+  bmeReady = bme.begin(0x76) || bme.begin(0x77);
+  if (bmeReady) {
+    Serial.println(F("BME280 ready on I2C."));
+  } else {
+    Serial.println(F("BME280 not found (0x76/0x77)."));
+  }
+
+  // Seeed_HM330X: init() returns non-zero on failure.
+  dustReady = (dustSensor.init() == 0);
+  if (dustReady) {
+    Serial.println(F("HM3301 dust sensor ready on I2C."));
+  } else {
+    Serial.println(F("HM3301 not found."));
+  }
+
+  Serial.println(F("Probing SIM800 on shared UART..."));
+  simReady = sendAtCommand("AT", 1500);
+  if (simReady) {
+    sendAtCommand("AT+CMGF=1", 1000);
+    sendAtCommand("AT+CSQ", 1000);
+    Serial.println(F("SIM800 responded to AT."));
+  } else {
+    Serial.println(F("SIM800 not responding (GPS may still use this UART)."));
+  }
+
+  Serial.printf("Gas ADC on GPIO%d.\n", GAS_ADC_PIN);
+  return bmeReady || dustReady;
 }
 
 void connectWiFi() {
@@ -250,17 +325,194 @@ void setClock() {
   }
 }
 
+void pollGps() {
+  while (GpsSimSerial.available() > 0) {
+    char c = static_cast<char>(GpsSimSerial.read());
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (gpsLine.length() > 10) parseGpsSentence(gpsLine);
+      gpsLine = "";
+    } else if (gpsLine.length() < 120) {
+      gpsLine += c;
+    } else {
+      gpsLine = "";
+    }
+  }
+
+  if (gpsFixValid && millis() - lastGpsFixMs > GPS_STALE_MS) {
+    gpsFixValid = false;
+    latestLatitude = NAN;
+    latestLongitude = NAN;
+  }
+}
+
+float nmeaToDegrees(const String &raw, const char hemisphere) {
+  if (raw.length() < 4) return NAN;
+  // Latitude uses 2 degree digits (ddmm.mmmm); longitude uses 3 (dddmm.mmmm).
+  const bool isLon = (hemisphere == 'E' || hemisphere == 'W' ||
+                      hemisphere == 'e' || hemisphere == 'w');
+  const int degreesDigits = isLon ? 3 : 2;
+  if (raw.length() <= degreesDigits) return NAN;
+  float degrees = raw.substring(0, degreesDigits).toFloat();
+  float minutes = raw.substring(degreesDigits).toFloat();
+  float value = degrees + (minutes / 60.0f);
+  if (hemisphere == 'S' || hemisphere == 'W' || hemisphere == 's' || hemisphere == 'w') {
+    value = -value;
+  }
+  return value;
+}
+
+bool parseGpsSentence(const String &sentence) {
+  // Accept GPRMC / GNRMC: ...,status,lat,N/S,lon,E/W,...
+  if (!(sentence.startsWith("$GPRMC") || sentence.startsWith("$GNRMC"))) {
+    return false;
+  }
+
+  String fields[12];
+  int fieldCount = 0;
+  int start = 0;
+  for (int i = 0; i <= sentence.length() && fieldCount < 12; ++i) {
+    if (i == sentence.length() || sentence.charAt(i) == ',') {
+      fields[fieldCount++] = sentence.substring(start, i);
+      start = i + 1;
+    }
+  }
+  if (fieldCount < 7) return false;
+  if (fields[2] != "A") return false;  // A = valid fix
+
+  float lat = nmeaToDegrees(fields[3], fields[4].length() ? fields[4].charAt(0) : 'N');
+  float lon = nmeaToDegrees(fields[5], fields[6].length() ? fields[6].charAt(0) : 'E');
+  if (!isfinite(lat) || !isfinite(lon)) return false;
+
+  latestLatitude = lat;
+  latestLongitude = lon;
+  gpsFixValid = true;
+  lastGpsFixMs = millis();
+  return true;
+}
+
+bool sendAtCommand(const char *command, unsigned long waitMs) {
+  while (GpsSimSerial.available()) GpsSimSerial.read();
+  GpsSimSerial.println(command);
+
+  String response;
+  unsigned long started = millis();
+  while (millis() - started < waitMs) {
+    while (GpsSimSerial.available()) {
+      char c = static_cast<char>(GpsSimSerial.read());
+      response += c;
+      Serial.write(c);
+    }
+    if (response.indexOf("OK") >= 0) return true;
+    if (response.indexOf("ERROR") >= 0) return false;
+    delay(10);
+  }
+  return response.indexOf("OK") >= 0;
+}
+
+bool sendSms(const String &message) {
+  if (!simReady) return false;
+  while (GpsSimSerial.available()) GpsSimSerial.read();
+
+  GpsSimSerial.print(F("AT+CMGS=\""));
+  GpsSimSerial.print(SMS_PHONE);
+  GpsSimSerial.println(F("\""));
+  delay(800);
+  GpsSimSerial.print(message);
+  GpsSimSerial.write(26);  // Ctrl+Z
+
+  String response;
+  unsigned long started = millis();
+  while (millis() - started < 8000) {
+    while (GpsSimSerial.available()) {
+      char c = static_cast<char>(GpsSimSerial.read());
+      response += c;
+      Serial.write(c);
+    }
+    if (response.indexOf("OK") >= 0 || response.indexOf("+CMGS") >= 0) return true;
+    if (response.indexOf("ERROR") >= 0) return false;
+    delay(20);
+  }
+  return false;
+}
+
+void maybeSendSmsAlert() {
+  if (!simReady) return;
+  if (!isfinite(latestGasRaw) || latestGasRaw < GAS_ALERT_THRESHOLD) return;
+  if (millis() - lastSmsMs < 300000UL && lastSmsMs != 0) return;  // 5 min cooldown
+
+  String msg = "DroneSat alert: gas=";
+  msg += String(latestGasRaw, 0);
+  if (isfinite(latestPm25)) {
+    msg += " pm2.5=";
+    msg += String(latestPm25, 0);
+  }
+  if (gpsFixValid) {
+    msg += " lat=";
+    msg += String(latestLatitude, 5);
+    msg += " lon=";
+    msg += String(latestLongitude, 5);
+  }
+  if (sendSms(msg)) {
+    lastSmsMs = millis();
+    Serial.println(F("SMS alert sent."));
+  }
+}
+
 void readSensors() {
-  // Sensor hardware is intentionally not connected in this ESP32 stage.
-  // Populate these seven values here when the ESP32 sensor code is supplied.
-  // NAN values are omitted from the multipart request and become SQL NULL.
-  latestTemperature = NAN;
-  latestHumidity = NAN;
-  latestPressure = NAN;
-  latestIlluminance = NAN;
-  latestUva = NAN;
-  latestUvb = NAN;
-  latestUvIndex = NAN;
+  if (bmeReady) {
+    float t = bme.readTemperature();
+    float h = bme.readHumidity();
+    float p = bme.readPressure() / 100.0F;
+    latestTemperature = isfinite(t) ? t : NAN;
+    latestHumidity = isfinite(h) ? h : NAN;
+    latestPressure = isfinite(p) ? p : NAN;
+  } else {
+    latestTemperature = NAN;
+    latestHumidity = NAN;
+    latestPressure = NAN;
+  }
+
+  if (dustReady) {
+    uint8_t buf[29];
+    if (dustSensor.read_sensor_value(buf, 29) == 0) {
+      latestPm1 = (buf[6] << 8) | buf[7];
+      latestPm25 = (buf[8] << 8) | buf[9];
+      latestPm10 = (buf[10] << 8) | buf[11];
+    } else {
+      latestPm1 = NAN;
+      latestPm25 = NAN;
+      latestPm10 = NAN;
+    }
+  } else {
+    latestPm1 = NAN;
+    latestPm25 = NAN;
+    latestPm10 = NAN;
+  }
+
+  latestGasRaw = static_cast<float>(analogRead(GAS_ADC_PIN));
+
+  // Refresh CSQ occasionally without blocking GPS for long.
+  if (simReady && (readingSequence % 4 == 0)) {
+    while (GpsSimSerial.available()) GpsSimSerial.read();
+    GpsSimSerial.println(F("AT+CSQ"));
+    String response;
+    unsigned long started = millis();
+    while (millis() - started < 800) {
+      while (GpsSimSerial.available()) response += static_cast<char>(GpsSimSerial.read());
+      delay(10);
+    }
+    int idx = response.indexOf("+CSQ:");
+    if (idx >= 0) {
+      int rssi = response.substring(idx + 5).toInt();
+      if (rssi >= 0 && rssi <= 31) latestSimSignal = static_cast<float>(rssi);
+    }
+  }
+
+  Serial.printf(
+    "Sensors T=%.1f H=%.1f P=%.0f PM2.5=%.0f GAS=%.0f LAT=%.5f LON=%.5f\n",
+    latestTemperature, latestHumidity, latestPressure, latestPm25,
+    latestGasRaw, latestLatitude, latestLongitude);
 }
 
 bool captureAndUpload() {
@@ -350,10 +602,13 @@ bool sendMultipart(WiFiClientSecure &client, const String &readingId) {
   if (!writeFloatPart(client, "temperature", latestTemperature)) return false;
   if (!writeFloatPart(client, "humidity", latestHumidity)) return false;
   if (!writeFloatPart(client, "pressure", latestPressure)) return false;
-  if (!writeFloatPart(client, "illuminance", latestIlluminance)) return false;
-  if (!writeFloatPart(client, "uva", latestUva)) return false;
-  if (!writeFloatPart(client, "uvb", latestUvb)) return false;
-  if (!writeFloatPart(client, "uv_index", latestUvIndex)) return false;
+  if (!writeFloatPart(client, "pm1", latestPm1)) return false;
+  if (!writeFloatPart(client, "pm2_5", latestPm25)) return false;
+  if (!writeFloatPart(client, "pm10", latestPm10)) return false;
+  if (!writeFloatPart(client, "gas_raw", latestGasRaw)) return false;
+  if (!writeFloatPart(client, "latitude", latestLatitude)) return false;
+  if (!writeFloatPart(client, "longitude", latestLongitude)) return false;
+  if (!writeFloatPart(client, "sim_signal", latestSimSignal)) return false;
 
   String imageHeader = "--" + String(MULTIPART_BOUNDARY) + "\r\n";
   imageHeader += "Content-Disposition: form-data; name=\"image\"; "

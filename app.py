@@ -14,6 +14,16 @@ What it does, per reading:
      combined row (sensors + prediction + image URL) into the "readings"
      table. The dashboard picks it up via Supabase Realtime.
 
+New telemetry columns (run once in Supabase SQL editor if missing):
+    alter table public.readings
+      add column if not exists pm1 double precision,
+      add column if not exists pm2_5 double precision,
+      add column if not exists pm10 double precision,
+      add column if not exists gas_raw double precision,
+      add column if not exists latitude double precision,
+      add column if not exists longitude double precision,
+      add column if not exists sim_signal double precision;
+
 Local run (for testing before you deploy):
     export SUPABASE_URL="https://xxxx.supabase.co"
     export SUPABASE_SERVICE_KEY="your-secret-key"
@@ -136,6 +146,13 @@ def ingest():
             "uva": _optional_float("uva"),
             "uvb": _optional_float("uvb"),
             "uvIndex": _optional_float("uv_index", "uvIndex"),
+            "pm1": _optional_float("pm1"),
+            "pm2_5": _optional_float("pm2_5", "pm25"),
+            "pm10": _optional_float("pm10"),
+            "gas_raw": _optional_float("gas_raw", "gas"),
+            "latitude": _optional_float("latitude", "lat"),
+            "longitude": _optional_float("longitude", "lon", "lng"),
+            "sim_signal": _optional_float("sim_signal", "csq"),
         }
         prediction = _run_inference(image_bytes)
     except ValueError as exc:
@@ -286,6 +303,13 @@ def _push_to_supabase(reading_id, record, partial, require_image_backup=False):
         "uva": sensor.get("uva"),
         "uvb": sensor.get("uvb"),
         "uv_index": sensor.get("uvIndex"),
+        "pm1": sensor.get("pm1"),
+        "pm2_5": sensor.get("pm2_5"),
+        "pm10": sensor.get("pm10"),
+        "gas_raw": sensor.get("gas_raw"),
+        "latitude": sensor.get("latitude"),
+        "longitude": sensor.get("longitude"),
+        "sim_signal": sensor.get("sim_signal"),
         "image_url": image_url,
         "prediction": prediction.get("class"),
         "confidence": prediction.get("confidence"),

@@ -254,11 +254,21 @@
       margin-bottom: 20px;
     }
 
+    @media (max-width: 720px) {
+      .telemetry-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
     .stat-card {
       background: var(--panel-2);
       border: 1px solid var(--border);
       border-radius: 9px;
       padding: 12px 10px;
+    }
+
+    .stat-card.wide {
+      grid-column: span 2;
     }
 
     .stat-label {
@@ -280,6 +290,13 @@
       font-size: 11px;
       color: var(--text-muted);
       margin-left: 2px;
+    }
+
+    .geo-line {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 4px;
     }
 
     .breakdown-title {
@@ -328,7 +345,7 @@
 
     .log-row {
       display: grid;
-      grid-template-columns: 90px 110px 70px 1fr;
+      grid-template-columns: 90px 110px 70px 1fr 1fr;
       gap: 12px;
       align-items: center;
       padding: 9px 4px;
@@ -456,9 +473,17 @@
 
     const STATUS = {
       nothing: { label: 'ALL CLEAR', sub: 'no fire or smoke in the latest frame', color: 'var(--c-nothing)' },
-      smoke: { label: 'SMOKE DETECTED', sub: 'smoke, no confirmed fire', color: 'var(--c-smoke)' },
-      fire: { label: 'FIRE DETECTED', sub: 'fire visible in the latest frame', color: 'var(--c-fire)' },
+      // Model class names for fire/smoke were swapped relative to ground truth.
+      smoke: { label: 'FIRE DETECTED', sub: 'fire visible in the latest frame', color: 'var(--c-fire)' },
+      fire: { label: 'SMOKE DETECTED', sub: 'smoke, no confirmed fire', color: 'var(--c-smoke)' },
       both: { label: 'FIRE + SMOKE', sub: 'both fire and smoke detected', color: 'var(--c-both)' },
+    };
+
+    const CLASS_DISPLAY = {
+      nothing: 'nothing',
+      smoke: 'fire',
+      fire: 'smoke',
+      both: 'both',
     };
 
     const els = {
@@ -480,6 +505,10 @@
       return STATUS[prediction] || { label: (prediction || 'UNKNOWN').toUpperCase(), sub: '', color: 'var(--c-unknown)' };
     }
 
+    function displayClass(prediction) {
+      return CLASS_DISPLAY[prediction] || prediction || 'unknown';
+    }
+
     function timeAgo(iso) {
       if (!iso) return '';
       const seconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
@@ -492,22 +521,30 @@
     }
 
     function fmt(value, digits = 1) {
-      return (value === null || value === undefined) ? '—' : Number(value).toFixed(digits);
+      return (value === null || value === undefined || Number.isNaN(Number(value)))
+        ? '—'
+        : Number(value).toFixed(digits);
     }
 
     function renderTelemetry(row) {
+      const lat = row.latitude;
+      const lon = row.longitude;
+      const hasGeo = lat != null && lon != null && !Number.isNaN(Number(lat)) && !Number.isNaN(Number(lon));
       const stats = [
-        ['TEMP', fmt(row.temperature), '°C'],
-        ['HUMIDITY', fmt(row.humidity), '%'],
-        ['PRESSURE', fmt(row.pressure, 0), 'hPa'],
-        ['LIGHT', fmt(row.illuminance, 0), 'lux'],
-        ['UV INDEX', fmt(row.uv_index, 1), ''],
-        ['UVA', fmt(row.uva, 1), ''],
+        ['TEMP', fmt(row.temperature), '°C', false],
+        ['HUMIDITY', fmt(row.humidity), '%', false],
+        ['PRESSURE', fmt(row.pressure, 0), 'hPa', false],
+        ['PM1.0', fmt(row.pm1, 0), 'µg/m³', false],
+        ['PM2.5', fmt(row.pm2_5, 0), 'µg/m³', false],
+        ['PM10', fmt(row.pm10, 0), 'µg/m³', false],
+        ['GAS ADC', fmt(row.gas_raw, 0), '', false],
+        ['SIM CSQ', fmt(row.sim_signal, 0), '', false],
+        ['LOCATION', hasGeo ? `${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)}` : '—', '', true],
       ];
-      els.telemetryGrid.innerHTML = stats.map(([label, value, unit]) => `
-    <div class="stat-card">
+      els.telemetryGrid.innerHTML = stats.map(([label, value, unit, wide]) => `
+    <div class="stat-card${wide ? ' wide' : ''}">
       <div class="stat-label">${label}</div>
-      <div class="stat-value">${value}<span class="stat-unit">${unit}</span></div>
+      <div class="stat-value">${value}${unit ? `<span class="stat-unit">${unit}</span>` : ''}</div>
     </div>
   `).join('');
     }
@@ -520,7 +557,7 @@
         const pct = Math.round(p * 100);
         return `
       <div class="breakdown-row">
-        <div class="breakdown-name">${name}</div>
+        <div class="breakdown-name">${displayClass(name)}</div>
         <div class="breakdown-bar-track">
           <div class="breakdown-bar-fill" style="width:${pct}%; background:${color};"></div>
         </div>
@@ -562,12 +599,14 @@
         const s = statusFor(row.prediction);
         const t = row.created_at ? new Date(row.created_at).toLocaleTimeString() : '—';
         const conf = row.confidence != null ? `${Math.round(row.confidence * 100)}%` : '—';
+        const gas = row.gas_raw != null ? `gas ${fmt(row.gas_raw, 0)}` : '';
         return `
       <div class="log-row">
         <div class="log-time">${t}</div>
-        <div class="log-verdict" style="color:${s.color}">${row.prediction || 'unknown'}</div>
+        <div class="log-verdict" style="color:${s.color}">${displayClass(row.prediction)}</div>
         <div class="log-conf">${conf}</div>
         <div class="log-temp">${fmt(row.temperature)}°C</div>
+        <div class="log-temp">${gas || `pm2.5 ${fmt(row.pm2_5, 0)}`}</div>
       </div>
     `;
       }).join('');
@@ -609,16 +648,23 @@
 
       supabase
         .channel('readings-changes')
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: READINGS_TABLE },
-          () => loadInitial(supabase)  // simplest correct approach: re-fetch the top N on any insert
+        .on('postgres_changes',
+          { event: 'INSERT', schema: 'public', table: READINGS_TABLE },
+          () => loadInitial(supabase)
+        )
+        .on('postgres_changes',
+          { event: 'UPDATE', schema: 'public', table: READINGS_TABLE },
+          () => loadInitial(supabase)
         )
         .subscribe();
 
       // Keep the "Xs ago" label fresh between inserts.
       setInterval(() => {
-        if (latestCreatedAt) {
-          els.heroMeta.textContent = els.heroMeta.textContent.replace(/[^·]*$/, timeAgo(latestCreatedAt));
-        }
+        if (!latestCreatedAt) return;
+        const confPrefix = els.heroMeta.textContent.includes('%')
+          ? els.heroMeta.textContent.split('·')[0] + '· '
+          : '';
+        els.heroMeta.textContent = `${confPrefix}${timeAgo(latestCreatedAt)}`;
       }, 5000);
     }
 
