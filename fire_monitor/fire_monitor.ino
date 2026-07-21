@@ -6,7 +6,8 @@
   Pin map (this board):
     ArduCAM SPI : CS=5, SCK=18, MISO=19, MOSI=23 (VSPI defaults)
     I2C bus     : SDA=21, SCL=22 — shared by ArduCAM, BME280, HM3301 dust
-    GPS + SIM   : shared UART RX=3, TX=1 (GPS NMEA listen; SIM AT when needed)
+    GPS UART    : RX=16, TX=17 (UART2; keeps USB debug UART 1/3 free)
+    SIM         : disabled until it has a dedicated UART/power supply
     MQ gas      : GPIO33 analog
 */
 #include <WiFi.h>
@@ -26,22 +27,31 @@
 #define SERVER_PORT      443
 #define INGEST_PATH      "/ingest"
 
-// Change CAM_CS / SMS_PHONE if your wiring or alert number differs.
+// GPIO 1/3 are reserved for Serial Monitor at 115200. The former GPS/SIM
+// mapping on those pins reconfigured the debug UART to 9600 and caused the
+// square/garbled output. Rewire GPS TX->16 and GPS RX->17.
 const int CAM_CS = 5;
 const int I2C_SDA = 21;
 const int I2C_SCL = 22;
-const int GPS_SIM_RX = 3;   // ESP32 RX  <- module TX
-const int GPS_SIM_TX = 1;   // ESP32 TX  -> module RX (SIM needs this)
+const int GPS_RX = 16;      // ESP32 RX  <- GPS TX
+const int GPS_TX = 17;      // ESP32 TX  -> GPS RX
 const int GAS_ADC_PIN = 33;
-const char SMS_PHONE[] = "+21644633222";
+
+const bool ENABLE_CAMERA = true;
+const bool ENABLE_BME280 = true;
+const bool ENABLE_DUST = true;
+const bool ENABLE_GAS = true;
+const bool ENABLE_GPS = true;
+const bool ENABLE_SIM = false;
+const bool AUTO_SYNC_ON_BOOT = true;
 
 const unsigned long CLOUD_SYNC_INTERVAL_MS = 15000;
 const unsigned long CAPTURE_TIMEOUT_MS = 5000;
 const unsigned long RESPONSE_TIMEOUT_MS = 130000;
 const unsigned long GPS_STALE_MS = 30000;
+const unsigned long SENSOR_RETRY_INTERVAL_MS = 60000;
 const size_t IMAGE_CHUNK_SIZE = 1024;
 const uint8_t MAX_UPLOAD_ATTEMPTS = 2;
-const int GAS_ALERT_THRESHOLD = 2500;  // raw ADC (0-4095); tune on site
 const char MULTIPART_BOUNDARY[] = "----DroneSatESP32Boundary7MA4YWxk";
 
 #if !(defined(OV5640_MINI_5MP_PLUS) || defined(OV5642_MINI_5MP_PLUS))
@@ -56,7 +66,7 @@ ArduCAM myCAM(OV5642, CAM_CS);
 
 Adafruit_BME280 bme;
 HM330X dustSensor;
-HardwareSerial GpsSimSerial(2);  // UART2 remapped onto GPIO3/1
+HardwareSerial GpsSerial(2);
 
 // Render currently uses either Let's Encrypt or Google Trust Services.
 // These are the ISRG Root X1, GTS Root R1, and GTS Root R4 trust anchors.
@@ -149,27 +159,48 @@ float latestSimSignal = NAN;
 
 bool bmeReady = false;
 bool dustReady = false;
-bool simReady = false;
+bool cameraReady = false;
+bool gasReady = false;
+bool gpsReady = false;
 bool gpsFixValid = false;
+bool autoSyncEnabled = AUTO_SYNC_ON_BOOT;
 unsigned long lastGpsFixMs = 0;
 unsigned long lastCloudSyncTime = 0;
-unsigned long lastSmsMs = 0;
+unsigned long lastSensorRetryMs = 0;
 uint32_t readingSequence = 0;
+uint8_t bmeFailStreak = 0;
+uint8_t dustFailStreak = 0;
+const uint8_t SENSOR_FAIL_LIMIT = 3;
 String gpsLine;
+String commandLine;
+String cycleLog;
 
+void noteBmeFailure();
+void noteDustFailure();
 bool initializeCamera();
-bool initializeSensors();
+void initializeComponents();
+void retryUnavailableSensors();
+void recoverI2cBus();
+bool probeI2cAddress(uint8_t address);
+bool initBme280();
+bool initDustSensor();
+bool readBme280();
+bool readDustSensor();
 void connectWiFi();
 void setClock();
 void pollGps();
 bool parseGpsSentence(const String &sentence);
 float nmeaToDegrees(const String &raw, const char hemisphere);
 void readSensors();
-void maybeSendSmsAlert();
-bool sendAtCommand(const char *command, unsigned long waitMs = 1000);
-bool sendSms(const String &message);
+void handleSerialCommands();
+void executeCommand(String command);
+void printStatus();
+void logEvent(const char *level, const char *component, const String &message);
+String componentStatusJson();
+String telemetryLogLine();
 bool captureAndUpload();
-bool sendMultipart(WiFiClientSecure &client, const String &readingId);
+bool sendMultipart(WiFiClientSecure &client, const String &readingId,
+                   bool includeImage);
 bool streamJpegPart(WiFiClientSecure &client);
 bool writeAll(WiFiClientSecure &client, const uint8_t *data, size_t length);
 bool writeChunk(WiFiClientSecure &client, const uint8_t *data, size_t length);
@@ -181,7 +212,11 @@ int readHttpStatus(WiFiClientSecure &client);
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 5000);
+  delay(300);
+  Serial.setDebugOutput(false);
+  Serial.println();
+  Serial.println(F("=== DroneSat ESP32 diagnostic firmware ==="));
+  Serial.println(F("Serial Monitor: 115200 baud, newline ending"));
 
   pinMode(CAM_CS, OUTPUT);
   digitalWrite(CAM_CS, HIGH);
@@ -189,18 +224,25 @@ void setup() {
   analogReadResolution(12);
 
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);  // 100 kHz is safer when ArduCAM + BME280 + HM3301 share the bus
+  Wire.setTimeOut(50);
   SPI.begin();
-  GpsSimSerial.begin(9600, SERIAL_8N1, GPS_SIM_RX, GPS_SIM_TX);
 
-  if (!initializeCamera()) {
-    Serial.println(F("Camera initialization failed; restart after checking wiring."));
-    while (true) delay(1000);
+  if (ENABLE_GPS) {
+    GpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+    logEvent("INFO", "GPS", "UART2 at 9600 on RX16/TX17; no_fix until outdoor sky lock");
+  } else {
+    logEvent("SKIP", "GPS", "disabled in configuration");
   }
+  logEvent("SKIP", "SIM", "disabled; no UART probing or SMS operations");
 
-  initializeSensors();
+  initializeComponents();
   connectWiFi();
   setClock();
-  Serial.println(F("Fire monitor ready."));
+  printStatus();
+  Serial.println(F("Commands: help, status, test wifi|camera|bme|dust|gas|gps, sync, auto on|off"));
+  Serial.println(F("GPS tip: no_fix is normal indoors; leave antenna skyward until RMC status becomes A"));
+  logEvent("INFO", "SYSTEM", "startup complete; unavailable components will be skipped");
 }
 
 bool initializeCamera() {
@@ -250,84 +292,197 @@ bool initializeCamera() {
 
 void loop() {
   pollGps();
+  handleSerialCommands();
+  retryUnavailableSensors();
 
   unsigned long now = millis();
-  if (lastCloudSyncTime == 0 ||
-      now - lastCloudSyncTime >= CLOUD_SYNC_INTERVAL_MS) {
+  if (autoSyncEnabled && (lastCloudSyncTime == 0 ||
+      now - lastCloudSyncTime >= CLOUD_SYNC_INTERVAL_MS)) {
     lastCloudSyncTime = now;
     readSensors();
-    maybeSendSmsAlert();
     captureAndUpload();
   }
   delay(10);
 }
 
-bool initializeSensors() {
-  bmeReady = bme.begin(0x76) || bme.begin(0x77);
+void recoverI2cBus() {
+  // Clear a hung shared I2C bus (common when ArduCAM, BME280, and HM3301 coexist).
+  Wire.end();
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  pinMode(I2C_SCL, OUTPUT);
+  for (uint8_t i = 0; i < 9; ++i) {
+    digitalWrite(I2C_SCL, LOW);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL, HIGH);
+    delayMicroseconds(5);
+  }
+  pinMode(I2C_SDA, OUTPUT);
+  digitalWrite(I2C_SDA, HIGH);
+  digitalWrite(I2C_SCL, HIGH);
+  delayMicroseconds(5);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);
+  delay(20);
+}
+
+bool probeI2cAddress(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+bool initBme280() {
+  recoverI2cBus();
+  if (!(probeI2cAddress(0x76) || probeI2cAddress(0x77))) return false;
+  bool ok = bme.begin(0x76) || bme.begin(0x77);
+  if (ok) bmeFailStreak = 0;
+  return ok;
+}
+
+bool initDustSensor() {
+  recoverI2cBus();
+  // HM3301 default I2C address is 0x40.
+  if (!probeI2cAddress(0x40)) return false;
+  bool ok = (dustSensor.init() == 0);
+  if (ok) dustFailStreak = 0;
+  return ok;
+}
+
+bool readBme280() {
+  recoverI2cBus();
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+  float p = bme.readPressure() / 100.0F;
+  if (!(isfinite(t) && isfinite(h) && isfinite(p))) return false;
+  // Reject clearly bogus pressure as a hung-bus symptom.
+  if (p < 300.0f || p > 1100.0f) return false;
+  latestTemperature = t;
+  latestHumidity = h;
+  latestPressure = p;
+  bmeFailStreak = 0;
+  return true;
+}
+
+bool readDustSensor() {
+  recoverI2cBus();
+  uint8_t buf[29];
+  if (dustSensor.read_sensor_value(buf, 29) != 0) return false;
+  // Atmospheric particulate concentrations (µg/m³).
+  latestPm1 = (buf[10] << 8) | buf[11];
+  latestPm25 = (buf[12] << 8) | buf[13];
+  latestPm10 = (buf[14] << 8) | buf[15];
+  dustFailStreak = 0;
+  return true;
+}
+
+void initializeComponents() {
+  cameraReady = false;
+  if (ENABLE_CAMERA) {
+    cameraReady = initializeCamera();
+    logEvent(cameraReady ? "OK" : "WARN", "CAMERA",
+             cameraReady ? "ArduCAM ready" : "unavailable; telemetry-only sync will continue");
+  } else {
+    logEvent("SKIP", "CAMERA", "disabled in configuration");
+  }
+
+  // Reclaim I2C after ArduCAM sensor register setup before probing env sensors.
+  recoverI2cBus();
+
+  bmeReady = ENABLE_BME280 && initBme280();
   if (bmeReady) {
-    Serial.println(F("BME280 ready on I2C."));
+    logEvent("OK", "BME280", "ready on I2C");
   } else {
-    Serial.println(F("BME280 not found (0x76/0x77)."));
+    logEvent(ENABLE_BME280 ? "WARN" : "SKIP", "BME280",
+             ENABLE_BME280 ? "not found at 0x76/0x77; will retry" : "disabled");
   }
 
-  // Seeed_HM330X: init() returns non-zero on failure.
-  dustReady = (dustSensor.init() == 0);
+  dustReady = ENABLE_DUST && initDustSensor();
   if (dustReady) {
-    Serial.println(F("HM3301 dust sensor ready on I2C."));
+    logEvent("OK", "DUST", "HM3301 ready on I2C");
   } else {
-    Serial.println(F("HM3301 not found."));
+    logEvent(ENABLE_DUST ? "WARN" : "SKIP", "DUST",
+             ENABLE_DUST ? "HM3301 unavailable; will retry" : "disabled");
   }
 
-  Serial.println(F("Probing SIM800 on shared UART..."));
-  simReady = sendAtCommand("AT", 1500);
-  if (simReady) {
-    sendAtCommand("AT+CMGF=1", 1000);
-    sendAtCommand("AT+CSQ", 1000);
-    Serial.println(F("SIM800 responded to AT."));
-  } else {
-    Serial.println(F("SIM800 not responding (GPS may still use this UART)."));
-  }
+  gasReady = ENABLE_GAS;
+  logEvent(gasReady ? "OK" : "SKIP", "GAS",
+           gasReady ? "ADC enabled on GPIO33" : "disabled");
 
-  Serial.printf("Gas ADC on GPIO%d.\n", GAS_ADC_PIN);
-  return bmeReady || dustReady;
+  gpsReady = ENABLE_GPS;
+  lastSensorRetryMs = millis();
+}
+
+void retryUnavailableSensors() {
+  if (millis() - lastSensorRetryMs < SENSOR_RETRY_INTERVAL_MS) return;
+  lastSensorRetryMs = millis();
+
+  if (ENABLE_CAMERA && !cameraReady) {
+    cameraReady = initializeCamera();
+    recoverI2cBus();
+    logEvent(cameraReady ? "OK" : "WARN", "CAMERA",
+             cameraReady ? "recovered" : "retry failed");
+  }
+  if (ENABLE_BME280 && !bmeReady) {
+    bmeReady = initBme280();
+    logEvent(bmeReady ? "OK" : "WARN", "BME280",
+             bmeReady ? "recovered" : "retry failed");
+  }
+  if (ENABLE_DUST && !dustReady) {
+    dustReady = initDustSensor();
+    logEvent(dustReady ? "OK" : "WARN", "DUST",
+             dustReady ? "recovered" : "retry failed");
+  }
 }
 
 void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
-  Serial.print(F("Connecting to WiFi SSID: ")); Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  logEvent("INFO", "WIFI", "connecting to " + String(WIFI_SSID));
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-    delay(500);
-    Serial.print(".");
+  wl_status_t previous = WiFi.status();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(250);
+    wl_status_t current = WiFi.status();
+    if (current != previous) {
+      Serial.printf("[%10lu][DEBUG][WIFI] status %d -> %d\n",
+                    millis(), previous, current);
+      previous = current;
+    }
   }
-  Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("WiFi connected. IP: "));
-    Serial.println(WiFi.localIP());
+    logEvent("OK", "WIFI", "connected; IP=" + WiFi.localIP().toString() +
+             " RSSI=" + String(WiFi.RSSI()) + "dBm");
   } else {
-    Serial.print(F("WiFi connect FAILED. Status code: "));
-    Serial.println(WiFi.status());
+    logEvent("WARN", "WIFI", "connection timed out; status=" +
+             String(WiFi.status()) + "; operation skipped until next retry");
+    WiFi.disconnect(false);
   }
 }
 
 void setClock() {
+  if (WiFi.status() != WL_CONNECTED) {
+    logEvent("SKIP", "CLOCK", "no WiFi; NTP deferred");
+    return;
+  }
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.print(F("Synchronizing clock"));
+  logEvent("INFO", "CLOCK", "synchronizing NTP");
   unsigned long started = millis();
   while (time(nullptr) < 1700000000 && millis() - started < 15000) {
-    Serial.print(".");
-    delay(500);
+    delay(250);
   }
-  Serial.println();
   if (time(nullptr) < 1700000000) {
-    Serial.println(F("NTP failed; TLS certificate validation cannot continue."));
+    logEvent("WARN", "CLOCK", "NTP failed; TLS upload deferred");
+  } else {
+    logEvent("OK", "CLOCK", "time synchronized");
   }
 }
 
 void pollGps() {
-  while (GpsSimSerial.available() > 0) {
-    char c = static_cast<char>(GpsSimSerial.read());
+  if (!ENABLE_GPS) return;
+  while (GpsSerial.available() > 0) {
+    char c = static_cast<char>(GpsSerial.read());
     if (c == '\r') continue;
     if (c == '\n') {
       if (gpsLine.length() > 10) parseGpsSentence(gpsLine);
@@ -386,164 +541,248 @@ bool parseGpsSentence(const String &sentence) {
 
   latestLatitude = lat;
   latestLongitude = lon;
+  gpsReady = true;
   gpsFixValid = true;
   lastGpsFixMs = millis();
   return true;
 }
 
-bool sendAtCommand(const char *command, unsigned long waitMs) {
-  while (GpsSimSerial.available()) GpsSimSerial.read();
-  GpsSimSerial.println(command);
-
-  String response;
-  unsigned long started = millis();
-  while (millis() - started < waitMs) {
-    while (GpsSimSerial.available()) {
-      char c = static_cast<char>(GpsSimSerial.read());
-      response += c;
-      Serial.write(c);
-    }
-    if (response.indexOf("OK") >= 0) return true;
-    if (response.indexOf("ERROR") >= 0) return false;
-    delay(10);
+void logEvent(const char *level, const char *component, const String &message) {
+  Serial.printf("[%10lu][%s][%s] %s\n", millis(), level, component,
+                message.c_str());
+  if (cycleLog.length() < 900) {
+    if (cycleLog.length()) cycleLog += " | ";
+    cycleLog += String(level) + ":" + component + ":" + message;
   }
-  return response.indexOf("OK") >= 0;
 }
 
-bool sendSms(const String &message) {
-  if (!simReady) return false;
-  while (GpsSimSerial.available()) GpsSimSerial.read();
-
-  GpsSimSerial.print(F("AT+CMGS=\""));
-  GpsSimSerial.print(SMS_PHONE);
-  GpsSimSerial.println(F("\""));
-  delay(800);
-  GpsSimSerial.print(message);
-  GpsSimSerial.write(26);  // Ctrl+Z
-
-  String response;
-  unsigned long started = millis();
-  while (millis() - started < 8000) {
-    while (GpsSimSerial.available()) {
-      char c = static_cast<char>(GpsSimSerial.read());
-      response += c;
-      Serial.write(c);
-    }
-    if (response.indexOf("OK") >= 0 || response.indexOf("+CMGS") >= 0) return true;
-    if (response.indexOf("ERROR") >= 0) return false;
-    delay(20);
-  }
-  return false;
+String componentStatusJson() {
+  String json = "{";
+  json += "\"wifi\":\"";
+  json += WiFi.status() == WL_CONNECTED ? "ok" : "unavailable";
+  json += "\",\"camera\":\"";
+  json += !ENABLE_CAMERA ? "disabled" : (cameraReady ? "ok" : "unavailable");
+  json += "\",\"bme280\":\"";
+  json += !ENABLE_BME280 ? "disabled" : (bmeReady ? "ok" : "unavailable");
+  json += "\",\"dust\":\"";
+  json += !ENABLE_DUST ? "disabled" : (dustReady ? "ok" : "unavailable");
+  json += "\",\"gas\":\"";
+  json += !ENABLE_GAS ? "disabled" : (gasReady ? "ok" : "unavailable");
+  json += "\",\"gps\":\"";
+  json += !ENABLE_GPS ? "disabled" : (gpsFixValid ? "ok" : "no_fix");
+  json += "\",\"sim\":\"";
+  json += ENABLE_SIM ? "unavailable" : "disabled";
+  json += "\"}";
+  return json;
 }
 
-void maybeSendSmsAlert() {
-  if (!simReady) return;
-  if (!isfinite(latestGasRaw) || latestGasRaw < GAS_ALERT_THRESHOLD) return;
-  if (millis() - lastSmsMs < 300000UL && lastSmsMs != 0) return;  // 5 min cooldown
+String telemetryLogLine() {
+  String line = "T=" + String(latestTemperature, 2);
+  line += " H=" + String(latestHumidity, 2);
+  line += " P=" + String(latestPressure, 2);
+  line += " PM1=" + String(latestPm1, 0);
+  line += " PM2.5=" + String(latestPm25, 0);
+  line += " PM10=" + String(latestPm10, 0);
+  line += " GAS=" + String(latestGasRaw, 0);
+  line += " LAT=" + String(latestLatitude, 6);
+  line += " LON=" + String(latestLongitude, 6);
+  line += " RSSI=" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+  return line;
+}
 
-  String msg = "DroneSat alert: gas=";
-  msg += String(latestGasRaw, 0);
-  if (isfinite(latestPm25)) {
-    msg += " pm2.5=";
-    msg += String(latestPm25, 0);
+void printStatus() {
+  Serial.println(F("\n--- COMPONENT STATUS ---"));
+  Serial.println(componentStatusJson());
+  Serial.println(F("------------------------"));
+}
+
+void handleSerialCommands() {
+  while (Serial.available()) {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\r') continue;
+    if (c == '\n') {
+      commandLine.trim();
+      if (commandLine.length()) executeCommand(commandLine);
+      commandLine = "";
+    } else if (commandLine.length() < 80) {
+      commandLine += c;
+    }
   }
-  if (gpsFixValid) {
-    msg += " lat=";
-    msg += String(latestLatitude, 5);
-    msg += " lon=";
-    msg += String(latestLongitude, 5);
+}
+
+void executeCommand(String command) {
+  command.toLowerCase();
+  command.trim();
+
+  if (command == "help") {
+    Serial.println(F("status | test wifi | test camera | test bme | test dust"));
+    Serial.println(F("test gas | test gps | sync | auto on | auto off"));
+  } else if (command == "status") {
+    printStatus();
+    Serial.println(telemetryLogLine());
+  } else if (command == "test wifi") {
+    WiFi.disconnect(false);
+    connectWiFi();
+  } else if (command == "test camera") {
+    cameraReady = ENABLE_CAMERA && initializeCamera();
+    logEvent(cameraReady ? "OK" : "WARN", "CAMERA",
+             cameraReady ? "manual test passed" : "manual test failed");
+  } else if (command == "test bme") {
+    bmeReady = ENABLE_BME280 && initBme280() && readBme280();
+    logEvent(bmeReady ? "OK" : "WARN", "BME280",
+             bmeReady ? telemetryLogLine() : "manual test failed");
+  } else if (command == "test dust") {
+    dustReady = ENABLE_DUST && initDustSensor() && readDustSensor();
+    logEvent(dustReady ? "OK" : "WARN", "DUST",
+             dustReady ? telemetryLogLine() : "manual test failed");
+  } else if (command == "test gas") {
+    latestGasRaw = static_cast<float>(analogRead(GAS_ADC_PIN));
+    gasReady = ENABLE_GAS;
+    logEvent(gasReady ? "OK" : "SKIP", "GAS",
+             gasReady ? "raw ADC=" + String(latestGasRaw, 0) : "disabled");
+  } else if (command == "test gps") {
+    logEvent(gpsFixValid ? "OK" : "WARN", "GPS",
+             gpsFixValid
+               ? "fix " + String(latestLatitude, 6) + "," + String(latestLongitude, 6)
+               : "no_fix: waiting for outdoor sky lock (can take 1-15 min)");
+  } else if (command == "sync") {
+    readSensors();
+    captureAndUpload();
+  } else if (command == "auto on") {
+    autoSyncEnabled = true;
+    logEvent("OK", "SYSTEM", "automatic sync enabled");
+  } else if (command == "auto off") {
+    autoSyncEnabled = false;
+    logEvent("OK", "SYSTEM", "automatic sync disabled");
+  } else {
+    logEvent("WARN", "COMMAND", "unknown command: " + command);
   }
-  if (sendSms(msg)) {
-    lastSmsMs = millis();
-    Serial.println(F("SMS alert sent."));
+}
+
+void noteBmeFailure() {
+  ++bmeFailStreak;
+  logEvent("WARN", "BME280",
+           "read failed (" + String(bmeFailStreak) + "/" +
+           String(SENSOR_FAIL_LIMIT) + "); recovering I2C");
+  if (bmeFailStreak >= SENSOR_FAIL_LIMIT) {
+    bmeReady = false;
+    latestTemperature = latestHumidity = latestPressure = NAN;
+    logEvent("WARN", "BME280", "marked unavailable after repeated failures");
+  }
+}
+
+void noteDustFailure() {
+  ++dustFailStreak;
+  logEvent("WARN", "DUST",
+           "read failed (" + String(dustFailStreak) + "/" +
+           String(SENSOR_FAIL_LIMIT) + "); recovering I2C");
+  if (dustFailStreak >= SENSOR_FAIL_LIMIT) {
+    dustReady = false;
+    latestPm1 = latestPm25 = latestPm10 = NAN;
+    logEvent("WARN", "DUST", "marked unavailable after repeated failures");
   }
 }
 
 void readSensors() {
-  if (bmeReady) {
-    float t = bme.readTemperature();
-    float h = bme.readHumidity();
-    float p = bme.readPressure() / 100.0F;
-    latestTemperature = isfinite(t) ? t : NAN;
-    latestHumidity = isfinite(h) ? h : NAN;
-    latestPressure = isfinite(p) ? p : NAN;
-  } else {
-    latestTemperature = NAN;
-    latestHumidity = NAN;
-    latestPressure = NAN;
-  }
+  cycleLog = "";
 
-  if (dustReady) {
-    uint8_t buf[29];
-    if (dustSensor.read_sensor_value(buf, 29) == 0) {
-      latestPm1 = (buf[6] << 8) | buf[7];
-      latestPm25 = (buf[8] << 8) | buf[9];
-      latestPm10 = (buf[10] << 8) | buf[11];
+  // Alternate which shared-I2C sensor is touched first so one hung chip
+  // cannot permanently starve the other.
+  const bool dustFirst = (readingSequence % 2) == 1;
+
+  if (dustFirst) {
+    if (dustReady) {
+      if (!readDustSensor()) noteDustFailure();
     } else {
-      latestPm1 = NAN;
-      latestPm25 = NAN;
-      latestPm10 = NAN;
+      latestPm1 = latestPm25 = latestPm10 = NAN;
+    }
+    delay(30);
+    if (bmeReady) {
+      if (!readBme280()) noteBmeFailure();
+    } else {
+      latestTemperature = latestHumidity = latestPressure = NAN;
     }
   } else {
-    latestPm1 = NAN;
-    latestPm25 = NAN;
-    latestPm10 = NAN;
-  }
-
-  latestGasRaw = static_cast<float>(analogRead(GAS_ADC_PIN));
-
-  // Refresh CSQ occasionally without blocking GPS for long.
-  if (simReady && (readingSequence % 4 == 0)) {
-    while (GpsSimSerial.available()) GpsSimSerial.read();
-    GpsSimSerial.println(F("AT+CSQ"));
-    String response;
-    unsigned long started = millis();
-    while (millis() - started < 800) {
-      while (GpsSimSerial.available()) response += static_cast<char>(GpsSimSerial.read());
-      delay(10);
+    if (bmeReady) {
+      if (!readBme280()) noteBmeFailure();
+    } else {
+      latestTemperature = latestHumidity = latestPressure = NAN;
     }
-    int idx = response.indexOf("+CSQ:");
-    if (idx >= 0) {
-      int rssi = response.substring(idx + 5).toInt();
-      if (rssi >= 0 && rssi <= 31) latestSimSignal = static_cast<float>(rssi);
+    delay(30);
+    if (dustReady) {
+      if (!readDustSensor()) noteDustFailure();
+    } else {
+      latestPm1 = latestPm25 = latestPm10 = NAN;
     }
   }
 
-  Serial.printf(
-    "Sensors T=%.1f H=%.1f P=%.0f PM2.5=%.0f GAS=%.0f LAT=%.5f LON=%.5f\n",
-    latestTemperature, latestHumidity, latestPressure, latestPm25,
-    latestGasRaw, latestLatitude, latestLongitude);
+  if (ENABLE_GAS) {
+    uint32_t gasSum = 0;
+    for (uint8_t i = 0; i < 16; ++i) {
+      gasSum += analogRead(GAS_ADC_PIN);
+      delay(2);
+    }
+    latestGasRaw = gasSum / 16.0f;
+    gasReady = true;
+  } else {
+    latestGasRaw = NAN;
+    gasReady = false;
+  }
+
+  latestSimSignal = NAN;
+  if (ENABLE_GPS && !gpsFixValid) {
+    logEvent("INFO", "GPS", "no_fix yet (needs clear sky view)");
+  }
+  logEvent("DATA", "TELEMETRY", telemetryLogLine());
 }
 
 bool captureAndUpload() {
+  // Camera SPI sessions can leave the shared I2C bus unsettled.
+  recoverI2cBus();
+
   connectWiFi();
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (time(nullptr) < 1700000000) {
-    setClock();
-    if (time(nullptr) < 1700000000) return false;
-  }
-
-  myCAM.flush_fifo();
-  myCAM.clear_fifo_flag();
-  myCAM.start_capture();
-
-  unsigned long started = millis();
-  while (!myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) {
-    if (millis() - started > CAPTURE_TIMEOUT_MS) {
-      Serial.println(F("Camera capture timed out."));
-      myCAM.clear_fifo_flag();
-      return false;
-    }
-    delay(1);
-  }
-
-  uint32_t length = myCAM.read_fifo_length();
-  if (length == 0 || length >= MAX_FIFO_SIZE) {
-    Serial.printf("Invalid camera FIFO length: %lu\n", (unsigned long)length);
-    myCAM.clear_fifo_flag();
+  if (WiFi.status() != WL_CONNECTED) {
+    logEvent("SKIP", "SYNC", "no WiFi; data retained in serial log");
     return false;
   }
-  Serial.printf("Captured %lu FIFO bytes.\n", (unsigned long)length);
+  if (time(nullptr) < 1700000000) {
+    setClock();
+    if (time(nullptr) < 1700000000) {
+      logEvent("SKIP", "SYNC", "clock invalid; verified TLS unavailable");
+      return false;
+    }
+  }
+
+  bool includeImage = false;
+  if (cameraReady) {
+    myCAM.flush_fifo();
+    myCAM.clear_fifo_flag();
+    myCAM.start_capture();
+
+    unsigned long started = millis();
+    while (!myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK) &&
+           millis() - started <= CAPTURE_TIMEOUT_MS) {
+      delay(1);
+    }
+
+    if (!myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) {
+      cameraReady = false;
+      myCAM.clear_fifo_flag();
+      logEvent("WARN", "CAMERA", "capture timed out; continuing telemetry-only");
+    } else {
+      uint32_t length = myCAM.read_fifo_length();
+      if (length == 0 || length >= MAX_FIFO_SIZE) {
+        cameraReady = false;
+        myCAM.clear_fifo_flag();
+        logEvent("WARN", "CAMERA", "invalid FIFO length; continuing telemetry-only");
+      } else {
+        includeImage = true;
+        logEvent("OK", "CAMERA", "captured " + String(length) + " FIFO bytes");
+      }
+    }
+  } else {
+    logEvent("SKIP", "CAMERA", "unavailable; sending telemetry-only reading");
+  }
 
   String readingId = makeReadingId();
   for (uint8_t attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; ++attempt) {
@@ -561,7 +800,7 @@ bool captureAndUpload() {
       continue;
     }
 
-    bool sent = sendMultipart(client, readingId);
+    bool sent = sendMultipart(client, readingId, includeImage);
     if (!sent) {
       Serial.println(F("Multipart transmission failed."));
       client.stop();
@@ -572,9 +811,9 @@ bool captureAndUpload() {
     int status = readHttpStatus(client);
     client.stop();
     if (status >= 200 && status < 300) {
-      myCAM.clear_fifo_flag();
-      Serial.printf("Reading %s stored successfully (HTTP %d).\n",
-                    readingId.c_str(), status);
+      if (includeImage) myCAM.clear_fifo_flag();
+      logEvent("OK", "SYNC", "reading " + readingId +
+               " stored; HTTP " + String(status));
       return true;
     }
 
@@ -583,11 +822,12 @@ bool captureAndUpload() {
     if (status >= 400 && status < 500) break;
     if (attempt < MAX_UPLOAD_ATTEMPTS) delay(1000);
   }
-  myCAM.clear_fifo_flag();
+  if (includeImage) myCAM.clear_fifo_flag();
   return false;
 }
 
-bool sendMultipart(WiFiClientSecure &client, const String &readingId) {
+bool sendMultipart(WiFiClientSecure &client, const String &readingId,
+                   bool includeImage) {
   String headers = "POST " + String(INGEST_PATH) + " HTTP/1.1\r\n";
   headers += "Host: " + String(RENDER_HOST) + "\r\n";
   headers += "Content-Type: multipart/form-data; boundary=";
@@ -608,16 +848,20 @@ bool sendMultipart(WiFiClientSecure &client, const String &readingId) {
   if (!writeFloatPart(client, "gas_raw", latestGasRaw)) return false;
   if (!writeFloatPart(client, "latitude", latestLatitude)) return false;
   if (!writeFloatPart(client, "longitude", latestLongitude)) return false;
-  if (!writeFloatPart(client, "sim_signal", latestSimSignal)) return false;
+  if (!writeTextPart(client, "device_status", componentStatusJson())) return false;
+  if (!writeTextPart(client, "device_log", cycleLog)) return false;
 
-  String imageHeader = "--" + String(MULTIPART_BOUNDARY) + "\r\n";
-  imageHeader += "Content-Disposition: form-data; name=\"image\"; "
-                 "filename=\"capture.jpg\"\r\n";
-  imageHeader += "Content-Type: image/jpeg\r\n\r\n";
-  if (!writeChunk(client, imageHeader)) return false;
-  if (!streamJpegPart(client)) return false;
+  if (includeImage) {
+    String imageHeader = "--" + String(MULTIPART_BOUNDARY) + "\r\n";
+    imageHeader += "Content-Disposition: form-data; name=\"image\"; "
+                   "filename=\"capture.jpg\"\r\n";
+    imageHeader += "Content-Type: image/jpeg\r\n\r\n";
+    if (!writeChunk(client, imageHeader)) return false;
+    if (!streamJpegPart(client)) return false;
+  }
 
-  String closing = "\r\n--" + String(MULTIPART_BOUNDARY) + "--\r\n";
+  String closing = includeImage ? "\r\n--" : "--";
+  closing += String(MULTIPART_BOUNDARY) + "--\r\n";
   if (!writeChunk(client, closing)) return false;
   return writeAll(client, reinterpret_cast<const uint8_t *>("0\r\n\r\n"), 5);
 }

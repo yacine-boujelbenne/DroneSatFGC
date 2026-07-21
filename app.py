@@ -22,7 +22,9 @@ New telemetry columns (run once in Supabase SQL editor if missing):
       add column if not exists gas_raw double precision,
       add column if not exists latitude double precision,
       add column if not exists longitude double precision,
-      add column if not exists sim_signal double precision;
+      add column if not exists sim_signal double precision,
+      add column if not exists device_status jsonb,
+      add column if not exists device_log text;
 
 Local run (for testing before you deploy):
     export SUPABASE_URL="https://xxxx.supabase.co"
@@ -43,6 +45,7 @@ run out of memory. One worker is plenty for a single board syncing every
 """
 
 import io
+import json
 import math
 import os
 import threading
@@ -128,16 +131,28 @@ def ingest():
         }), 400
 
     image = request.files.get("image")
-    if image is None:
-        return jsonify({"error": "image file part is required"}), 400
-
-    image_bytes = image.read(MAX_IMAGE_BYTES + 1)
-    if not image_bytes:
-        return jsonify({"error": "image is empty"}), 400
-    if len(image_bytes) > MAX_IMAGE_BYTES:
-        return jsonify({"error": "image exceeds 5 MiB limit"}), 413
+    image_bytes = None
+    if image is not None:
+        image_bytes = image.read(MAX_IMAGE_BYTES + 1)
+        if not image_bytes:
+            return jsonify({"error": "image is empty"}), 400
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            return jsonify({"error": "image exceeds 5 MiB limit"}), 413
 
     try:
+        raw_device_status = request.form.get("device_status", "{}")
+        device_status = json.loads(raw_device_status)
+        if not isinstance(device_status, dict):
+            raise ValueError("device_status must be a JSON object")
+        allowed_components = {"wifi", "camera", "bme280", "dust", "gas", "gps", "sim"}
+        allowed_states = {"ok", "no_fix", "unavailable", "disabled"}
+        device_status = {
+            component: state
+            for component, state in device_status.items()
+            if component in allowed_components
+            and isinstance(state, str)
+            and state in allowed_states
+        }
         sensor = {
             "temperature": _optional_float("temperature"),
             "humidity": _optional_float("humidity"),
@@ -153,29 +168,38 @@ def ingest():
             "latitude": _optional_float("latitude", "lat"),
             "longitude": _optional_float("longitude", "lon", "lng"),
             "sim_signal": _optional_float("sim_signal", "csq"),
+            "device_status": device_status,
+            "device_log": request.form.get("device_log", "")[:2000],
         }
-        prediction = _run_inference(image_bytes)
-    except ValueError as exc:
+        prediction = _run_inference(image_bytes) if image_bytes else {}
+    except (ValueError, json.JSONDecodeError) as exc:
         return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        print(f"[{reading_id}] inference failed: {exc}")
+        return jsonify({"error": "inference failed on server"}), 502
 
-    record = {
-        "sensor": sensor,
-        "image_bytes": image_bytes,
-        "prediction": prediction,
-    }
+    record = {"sensor": sensor, "prediction": prediction}
+    if image_bytes:
+        record["image_bytes"] = image_bytes
     row = _push_to_supabase(
-        reading_id, record, partial=False, require_image_backup=True
+        reading_id,
+        record,
+        partial=not bool(image_bytes),
+        require_image_backup=bool(image_bytes),
     )
     if row is None:
         return jsonify({"error": "failed to persist reading"}), 502
 
-    print(f"[{reading_id}] multipart reading received, prediction: "
-          f"{prediction['class']} ({prediction['confidence']:.2%})")
+    if prediction:
+        print(f"[{reading_id}] multipart reading received, prediction: "
+              f"{prediction['class']} ({prediction['confidence']:.2%})")
+    else:
+        print(f"[{reading_id}] telemetry-only reading received")
     return jsonify({
         "status": "ok",
         "reading_id": reading_id,
-        "prediction": prediction["class"],
-        "confidence": prediction["confidence"],
+        "prediction": prediction.get("class"),
+        "confidence": prediction.get("confidence"),
         "image_url": row["image_url"],
         "partial": row["partial"],
     }), 200
@@ -271,6 +295,25 @@ def _try_finalize(reading_id):
     _push_to_supabase(reading_id, record, partial=False)
 
 
+def _persist_reading_row(reading_id, row):
+    existing = (
+        supabase.table(READINGS_TABLE)
+        .select("id")
+        .eq("reading_id", reading_id)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        (
+            supabase.table(READINGS_TABLE)
+            .update(row)
+            .eq("id", existing.data[0]["id"])
+            .execute()
+        )
+    else:
+        supabase.table(READINGS_TABLE).insert(row).execute()
+
+
 def _push_to_supabase(reading_id, record, partial, require_image_backup=False):
     image_url = None
     storage_failed = False
@@ -310,6 +353,8 @@ def _push_to_supabase(reading_id, record, partial, require_image_backup=False):
         "latitude": sensor.get("latitude"),
         "longitude": sensor.get("longitude"),
         "sim_signal": sensor.get("sim_signal"),
+        "device_status": sensor.get("device_status"),
+        "device_log": sensor.get("device_log"),
         "image_url": image_url,
         "prediction": prediction.get("class"),
         "confidence": prediction.get("confidence"),
@@ -318,27 +363,26 @@ def _push_to_supabase(reading_id, record, partial, require_image_backup=False):
     }
 
     try:
-        existing = (
-            supabase.table(READINGS_TABLE)
-            .select("id")
-            .eq("reading_id", reading_id)
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            (
-                supabase.table(READINGS_TABLE)
-                .update(row)
-                .eq("id", existing.data[0]["id"])
-                .execute()
-            )
-        else:
-            supabase.table(READINGS_TABLE).insert(row).execute()
+        _persist_reading_row(reading_id, row)
         status = "PARTIAL" if row["partial"] else "complete"
         print(f"[{reading_id}] inserted into Supabase — {status} — "
               f"prediction={prediction.get('class', 'n/a')}")
         return row
     except Exception as exc:
+        # Free-tier / schema lag: retry without optional debug columns.
+        message = str(exc).lower()
+        if "device_status" in message or "device_log" in message:
+            fallback = dict(row)
+            fallback.pop("device_status", None)
+            fallback.pop("device_log", None)
+            try:
+                _persist_reading_row(reading_id, fallback)
+                print(f"[{reading_id}] inserted without device_status/device_log "
+                      f"(add those columns in Supabase for full diagnostics)")
+                return fallback
+            except Exception as nested:
+                print(f"[{reading_id}] Supabase insert failed: {nested}")
+                return None
         print(f"[{reading_id}] Supabase insert failed: {exc}")
         return None
 

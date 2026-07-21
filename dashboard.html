@@ -299,6 +299,26 @@
       margin-top: 4px;
     }
 
+    .health-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-bottom: 20px;
+    }
+
+    .health-chip {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 5px 9px;
+      font: 10px 'IBM Plex Mono', monospace;
+      text-transform: uppercase;
+    }
+
+    .health-chip.ok { color: var(--c-nothing); border-color: var(--c-nothing); }
+    .health-chip.no_fix { color: var(--c-both); border-color: var(--c-both); }
+    .health-chip.unavailable { color: var(--c-fire); border-color: var(--c-fire); }
+    .health-chip.disabled { color: var(--text-muted); }
+
     .breakdown-title {
       margin-top: 4px;
     }
@@ -384,6 +404,31 @@
       padding: 10px 4px;
     }
 
+    .log-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .download-button {
+      color: var(--accent);
+      background: transparent;
+      border: 1px solid var(--accent);
+      border-radius: 7px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font: 10px 'IBM Plex Mono', monospace;
+    }
+
+    .device-log {
+      max-height: 260px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: var(--text-muted);
+      font: 11px/1.6 'IBM Plex Mono', monospace;
+    }
+
     .config-warning {
       background: var(--panel-2);
       border: 1px solid var(--c-fire);
@@ -443,6 +488,8 @@
       <div class="panel">
         <div class="panel-title">TELEMETRY</div>
         <div class="telemetry-grid" id="telemetryGrid"></div>
+        <div class="panel-title">COMPONENT HEALTH</div>
+        <div class="health-grid" id="healthGrid"></div>
         <div class="panel-title breakdown-title">CONFIDENCE BREAKDOWN</div>
         <div id="breakdown"></div>
       </div>
@@ -453,6 +500,14 @@
       <div id="logTable">
         <div class="log-empty">no readings yet</div>
       </div>
+    </section>
+
+    <section class="panel log-panel">
+      <div class="log-heading">
+        <div class="panel-title">LIVE ESP DATA LOG</div>
+        <button class="download-button" id="downloadLog" type="button">DOWNLOAD CSV</button>
+      </div>
+      <div class="device-log" id="deviceLog">waiting for device log...</div>
     </section>
   </div>
 
@@ -469,7 +524,7 @@
     // ============================================================================
 
     const READINGS_TABLE = 'readings';
-    const HISTORY_LIMIT = 20;
+    const HISTORY_LIMIT = 200;
 
     const STATUS = {
       nothing: { label: 'ALL CLEAR', sub: 'no fire or smoke in the latest frame', color: 'var(--c-nothing)' },
@@ -494,12 +549,16 @@
       frameImg: document.getElementById('frameImg'),
       frameEmpty: document.getElementById('frameEmpty'),
       telemetryGrid: document.getElementById('telemetryGrid'),
+      healthGrid: document.getElementById('healthGrid'),
       breakdown: document.getElementById('breakdown'),
       logTable: document.getElementById('logTable'),
+      deviceLog: document.getElementById('deviceLog'),
+      downloadLog: document.getElementById('downloadLog'),
       configWarning: document.getElementById('configWarning'),
     };
 
     let latestCreatedAt = null;
+    let latestRows = [];
 
     function statusFor(prediction) {
       return STATUS[prediction] || { label: (prediction || 'UNKNOWN').toUpperCase(), sub: '', color: 'var(--c-unknown)' };
@@ -547,6 +606,74 @@
       <div class="stat-value">${value}${unit ? `<span class="stat-unit">${unit}</span>` : ''}</div>
     </div>
   `).join('');
+    }
+
+    function parseDeviceStatus(value) {
+      if (!value) return {};
+      if (typeof value === 'object') return value;
+      try { return JSON.parse(value); } catch { return {}; }
+    }
+
+    function renderHealth(row) {
+      const status = parseDeviceStatus(row.device_status);
+      const expected = ['wifi', 'camera', 'bme280', 'dust', 'gas', 'gps', 'sim'];
+      const allowedStates = new Set(['ok', 'no_fix', 'unavailable', 'disabled']);
+      els.healthGrid.replaceChildren(...expected.map(component => {
+        const reported = status[component];
+        const state = allowedStates.has(reported) ? reported : 'unavailable';
+        const chip = document.createElement('span');
+        chip.className = `health-chip ${state}`;
+        chip.textContent = `${component}: ${state.replace('_', ' ')}`;
+        return chip;
+      }));
+    }
+
+    function renderDeviceLog(rows) {
+      const chronological = [...rows].reverse();
+      els.deviceLog.textContent = chronological.map(row => {
+        const time = row.created_at ? new Date(row.created_at).toLocaleString() : 'unknown time';
+        const values = [
+          `T=${fmt(row.temperature, 2)}`,
+          `H=${fmt(row.humidity, 2)}`,
+          `P=${fmt(row.pressure, 2)}`,
+          `PM1=${fmt(row.pm1, 0)}`,
+          `PM2.5=${fmt(row.pm2_5, 0)}`,
+          `PM10=${fmt(row.pm10, 0)}`,
+          `GAS=${fmt(row.gas_raw, 0)}`,
+          `LAT=${fmt(row.latitude, 6)}`,
+          `LON=${fmt(row.longitude, 6)}`,
+        ].join(' ');
+        return `[${time}] ${values}${row.device_log ? ` | ${row.device_log}` : ''}`;
+      }).join('\n');
+      els.deviceLog.scrollTop = els.deviceLog.scrollHeight;
+    }
+
+    function csvCell(value) {
+      const text = value == null ? '' : String(value);
+      return `"${text.replaceAll('"', '""')}"`;
+    }
+
+    function downloadCsvLog() {
+      const columns = [
+        'created_at', 'reading_id', 'temperature', 'humidity', 'pressure',
+        'pm1', 'pm2_5', 'pm10', 'gas_raw', 'latitude', 'longitude',
+        'prediction', 'confidence', 'partial', 'device_status', 'device_log'
+      ];
+      const lines = [columns.join(',')];
+      [...latestRows].reverse().forEach(row => {
+        lines.push(columns.map(column => {
+          const value = column === 'device_status' && typeof row[column] === 'object'
+            ? JSON.stringify(row[column])
+            : row[column];
+          return csvCell(value);
+        }).join(','));
+      });
+      const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `dronesat-log-${new Date().toISOString().replaceAll(':', '-')}.csv`;
+      link.click();
+      URL.revokeObjectURL(link.href);
     }
 
     function renderBreakdown(probabilities) {
@@ -614,11 +741,15 @@
 
     function renderAll(rows) {
       if (!rows.length) return;
-      renderHero(rows[0]);
-      renderFrame(rows[0]);
+      latestRows = rows;
+      const visionRow = rows.find(row => row.prediction || row.image_url) || rows[0];
+      renderHero(visionRow);
+      renderFrame(visionRow);
       renderTelemetry(rows[0]);
-      renderBreakdown(rows[0].probabilities);
+      renderHealth(rows[0]);
+      renderBreakdown(visionRow.probabilities);
       renderLog(rows);
+      renderDeviceLog(rows);
     }
 
     async function loadInitial(supabase) {
@@ -637,6 +768,7 @@
     }
 
     function init() {
+      els.downloadLog.addEventListener('click', downloadCsvLog);
       if (SUPABASE_URL.includes('YOUR-PROJECT') || SUPABASE_ANON_KEY.includes('YOUR-ANON-KEY')) {
         els.configWarning.style.display = 'block';
         return;
